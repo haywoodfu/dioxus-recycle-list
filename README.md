@@ -1,6 +1,21 @@
 # dioxus-recycle-list
 
-Dynamic-height virtualization component for Dioxus.
+`dioxus-recycle-list` is a dynamic-height virtualized list component for Dioxus.
+
+## Why Recycle List
+
+By default, a normal list renders all items at once when the page loads.  
+With large datasets(>300), this can cause noticeable startup lag, especially on lower-performance mobile devices.
+
+To improve rendering performance, this project applies the `recycle list` (virtualized list) approach:
+
+- Render only a limited number of items around the visible viewport
+- Recycle and reuse item nodes while scrolling
+- Keep the user experience consistent with a normal list (same scrolling and content behavior)
+
+## Preview
+
+![dioxus-recycle-list preview](./preview/preview.webp)
 
 ## Usage
 
@@ -32,8 +47,7 @@ let view = recycle_list(&rows, 8, |row, idx| {
 
 ## Preview demo
 
-A web demo binary is available in `preview/`, but it is opt-in and does not
-participate in the default build.
+`preview/` provides an optional demo and is excluded from the default build.
 
 Run it with Dioxus CLI:
 
