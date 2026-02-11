@@ -1,0 +1,29 @@
+[package]
+name = "dioxus-recycle-list"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.0"
+description = "A dynamic-height virtualized list component for Dioxus"
+license = "MIT"
+
+[features]
+default = []
+preview = ["dioxus/web"]
+
+[[bin]]
+name = "preview"
+path = "preview/main.rs"
+required-features = ["preview"]
+
+[dependencies]
+dioxus = { version = "0.7", features = ["router"] }
+dioxus-web = { version = "0.7" }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "DomRect",
+    "Element",
+    "Event",
+    "EventTarget",
+    "HtmlElement",
+    "Window",
+] }
