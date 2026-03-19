@@ -23,8 +23,10 @@ fn main() {
 }
 
 const PREVIEW_CSS: &str = r#"
-    body {
+    * { box-sizing: border-box; }
+    html, body {
         margin: 0;
+        height: 100%;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         background: #f6f7fb;
         color: #1d2433;
@@ -32,18 +34,29 @@ const PREVIEW_CSS: &str = r#"
     .page {
         max-width: 860px;
         margin: 0 auto;
-        padding: 24px 16px 48px;
+        padding: 24px 16px 0;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
     }
     .headline {
         margin: 0 0 8px;
         font-size: 28px;
         font-weight: 700;
         letter-spacing: -0.02em;
+        flex-shrink: 0;
     }
     .sub {
         margin: 0 0 18px;
         color: #56607a;
         font-size: 14px;
+        flex-shrink: 0;
+    }
+    /* The recycle-list-container must be scrollable and have a bounded height. */
+    .recycle-list-container {
+        flex: 1;
+        overflow-y: auto;
+        outline: none;
     }
     .card {
         background: #ffffff;
@@ -85,6 +98,7 @@ fn App() -> Element {
                 RecycleList(RecycleListProps {
                     items: rows_ref.as_slice(),
                     buffer: 12,
+                    estimate_size: Some(|_| 90),
                     render_item: move |row, idx| {
                         let extra_text = "Extra content to change row height. "
                             .repeat(row.extra_lines);

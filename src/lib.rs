@@ -1,272 +1,395 @@
-#[cfg(target_arch = "wasm32")]
-use dioxus::dioxus_core::use_drop;
+//! A dynamic-height virtualized list component for Dioxus.
+//!
+//! Renders only the visible slice of a large list plus a configurable buffer,
+//! using a virtual canvas (absolute positioning + translateY) to preserve the
+//! correct total scroll height without top/bottom spacer hacks.
+
 use dioxus::prelude::*;
-#[cfg(target_arch = "wasm32")]
-use dioxus_web::WebEventExt;
-use std::sync::Arc;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::closure::Closure;
-#[cfg(target_arch = "wasm32")]
-use web_sys::HtmlElement;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(target_arch = "wasm32")]
-type WindowScrollClosure = Closure<dyn FnMut(web_sys::Event)>;
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
+fn next_id() -> String {
+    format!("recycle-list-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+// ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+/// A single virtualized item with its computed pixel position.
+#[derive(Debug, Clone, PartialEq)]
+struct VirtualItem {
+    index: usize,
+    start: u32,
+    size: u32,
+}
+
+impl VirtualItem {
+    fn end(&self) -> u32 {
+        self.start + self.size
+    }
+}
+
+/// Parsed scroll message received from the JS bridge.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScrollMsg {
+    offset: u32,
+    viewport: u32,
+    is_scrolling: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Measurements
+// ---------------------------------------------------------------------------
+
+/// Build a flat list of `VirtualItem`s from the size cache.
+///
+/// Unmeasured items are sized by:
+/// 1. The user-provided `estimate_size` callback (if any), or
+/// 2. The running average of all measured items (adaptive estimation), or
+/// 3. 100 px as a final fallback.
+fn compute_measurements(
+    count: usize,
+    cache: &HashMap<usize, u32>,
+    estimate_size: Option<&dyn Fn(usize) -> u32>,
+) -> Vec<VirtualItem> {
+    let adaptive = if estimate_size.is_none() && !cache.is_empty() {
+        let sum: u64 = cache.values().map(|&v| v as u64).sum();
+        Some(((sum / cache.len() as u64).max(1)) as u32)
+    } else {
+        None
+    };
+
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let size = cache.get(&i).copied().unwrap_or_else(|| {
+            estimate_size.map(|f| f(i)).unwrap_or(adaptive.unwrap_or(100))
+        });
+        let start = result.last().map(|m: &VirtualItem| m.end()).unwrap_or(0);
+        result.push(VirtualItem { index: i, start, size });
+    }
+    result
+}
+
+/// Return the virtual items that should be rendered given the current scroll
+/// position, viewport size, and overscan (buffer in item counts).
+fn get_virtual_items(
+    measurements: &[VirtualItem],
+    scroll_offset: u32,
+    viewport_size: u32,
+    buffer: usize,
+) -> Vec<VirtualItem> {
+    if measurements.is_empty() || viewport_size == 0 {
+        return Vec::new();
+    }
+
+    // Binary-search for the first item at or before the scroll offset.
+    let start_idx = measurements
+        .binary_search_by(|item| item.start.cmp(&scroll_offset))
+        .unwrap_or_else(|idx| idx.saturating_sub(1));
+
+    let end_scroll = scroll_offset.saturating_add(viewport_size);
+    let mut end_idx = start_idx;
+    let last = measurements.len() - 1;
+    while end_idx < last && measurements[end_idx].end() < end_scroll {
+        end_idx += 1;
+    }
+
+    // Apply overscan buffer.
+    let render_start = start_idx.saturating_sub(buffer);
+    let render_end = (end_idx + buffer).min(last);
+
+    measurements[render_start..=render_end].to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Props for [`RecycleList`].
 pub struct RecycleListProps<'a, T, F>
 where
     F: Fn(&T, usize) -> Element,
 {
+    /// The data slice to virtualize.
     pub items: &'a [T],
+    /// Number of extra items to render above and below the visible viewport
+    /// (overscan / buffer in item counts, not pixels).
     pub buffer: usize,
+    /// Renders a single item given a reference to its data and its absolute index.
     pub render_item: F,
+    /// Optional per-index height estimate (px) used before the item is measured.
+    /// When omitted the component uses an adaptive average of measured heights.
+    pub estimate_size: Option<fn(usize) -> u32>,
 }
 
-/// create a cycle list for large datasets, will recylce items as you scroll
+/// A dynamic-height virtualized list for Dioxus.
+///
+/// Only the visible slice plus `buffer` rows are present in the DOM.
+/// The total scroll height is preserved with a virtual canvas (relative
+/// container + absolute inner strip + `translateY`), so the browser's
+/// scrollbar behaves identically to a fully-rendered list.
+///
+/// # Scroll corrections
+/// When an item whose rendered height differs from its estimated height sits
+/// *above* the current scroll position, the component adjusts `scrollTop`
+/// automatically to prevent content from jumping.  Adjustments are deferred
+/// during active scrolling and applied once the user stops.
+///
+/// # Accessibility
+/// Each rendered row receives `aria-setsize` and `aria-posinset` attributes
+/// so screen readers can announce the total list size even though only a
+/// subset of items is in the DOM.
+///
+/// # Example
+///
+/// ```rust
+/// use dioxus::prelude::*;
+/// use dioxus_recycle_list::RecycleList;
+///
+/// #[component]
+/// fn Demo() -> Element {
+///     let items: Vec<String> = (0..10_000).map(|i| format!("Row {i}")).collect();
+///     rsx! {
+///         RecycleList {
+///             items: &items,
+///             buffer: 8,
+///             render_item: |item: &String, _idx| rsx! { div { "{item}" } },
+///         }
+///     }
+/// }
+/// ```
 #[allow(non_snake_case)]
 pub fn RecycleList<T: PartialEq + 'static, F>(props: RecycleListProps<'_, T, F>) -> Element
 where
     F: Fn(&T, usize) -> Element,
 {
-    let RecycleListProps {
-        items,
-        buffer,
-        render_item,
-    } = props;
-    let total = items.len();
+    let RecycleListProps { items, buffer, render_item, estimate_size } = props;
+    let count = items.len();
 
-    // 1. Subscribe to page scroll and keep list-relative scroll position in sync.
-    // 2. Track dynamic item heights and rebuild prefix sums when heights change.
-    // 3. Resolve visible render range from current scroll plus viewport and buffer.
-    // 4. Compute top and bottom spacer heights to preserve total scroll height.
-    // 5. Render only visible rows and update measured heights on row mount.
+    // Stable container ID – never changes after first render.
+    let container_id = use_memo(|| next_id());
 
-    // estimated each item height to 100px
-    let estimated_item_height: u32 = 100;
+    // --- Reactive scroll / viewport state ---
+    let mut scroll_offset = use_signal(|| 0u32);
+    let mut viewport_size = use_signal(|| 600u32);
+    let mut is_scrolling = use_signal(|| false);
 
-    // Scroll position signal (relative to list top, in px)
-    #[allow(unused_mut)]
-    let mut scroll_top = use_signal(|| 0);
-    #[cfg(target_arch = "wasm32")]
-    let mut container_el: Signal<Option<HtmlElement>> = use_signal(|| None);
-    #[cfg(target_arch = "wasm32")]
-    let window_scroll_listener = use_signal::<Option<WindowScrollClosure>>(|| None);
-    #[cfg(target_arch = "wasm32")]
-    let mut container_page_top = use_signal::<Option<f64>>(|| None);
-    #[cfg(target_arch = "wasm32")]
-    let viewport_height = use_signal(|| estimated_item_height.saturating_mul(8));
-    let mut measured_heights = use_signal(|| vec![estimated_item_height; total]);
+    // Frozen total size while scrolling to stop the scrollbar from drifting.
+    let mut stable_total_size: Signal<Option<u32>> = use_signal(|| None);
 
-    // Keep height cache length aligned with current items.
-    if measured_heights.read().len() != total {
-        measured_heights.with_mut(|heights| heights.resize(total, estimated_item_height));
+    // Accumulated correction for items that resize above the viewport.
+    let mut scroll_adjustments = use_signal(|| 0i32);
+    // Adjustments deferred until scrolling stops.
+    let mut deferred_adjustments = use_signal(|| 0i32);
+
+    // Measured item sizes, keyed by index.
+    let mut size_cache: Signal<HashMap<usize, u32>> = use_signal(HashMap::new);
+
+    // Keep count reactive so the memo re-runs when items slice length changes.
+    let mut count_sig = use_signal(|| count);
+    if *count_sig.peek() != count {
+        count_sig.set(count);
+        // Prune cache entries that are no longer valid.
+        size_cache.with_mut(|c| c.retain(|&k, _| k < count));
     }
 
-    // Get container viewport height and add scroll listener to get the scroll position
-    #[cfg(target_arch = "wasm32")]
-    {
-        use_effect({
-            let container_el = container_el.clone();
-            let mut window_scroll_listener = window_scroll_listener.clone();
-            let mut scroll_top = scroll_top.clone();
-            let container_page_top = container_page_top.clone();
-            let mut viewport_height = viewport_height.clone();
-            move || {
-                if container_el.read().is_none() || window_scroll_listener.read().is_some() {
-                    return;
-                }
-
-                let Some(window) = web_sys::window() else {
-                    return;
-                };
-
-                let viewport_px = window
-                    .inner_height()
-                    .ok()
-                    .and_then(|h| h.as_f64())
-                    .map(|h| h.max(1.0).round() as u32)
-                    .unwrap_or(estimated_item_height.saturating_mul(8));
-                viewport_height.set(viewport_px);
-
-                // Sync once on mount in case page is already scrolled.
-                if let Some(list_top_in_page) = *container_page_top.read() {
-                    let scroll_y = window.scroll_y().unwrap_or(0.0);
-                    let relative_scroll = (scroll_y - list_top_in_page).max(0.0) as u32;
-                    if relative_scroll != *scroll_top.read() {
-                        scroll_top.set(relative_scroll);
-                    }
-                }
-
-                let container_page_top_for_cb = container_page_top.clone();
-                let mut scroll_top_for_cb = scroll_top.clone();
-                let mut viewport_height_for_cb = viewport_height.clone();
-                let cb = Closure::wrap(Box::new(move |_evt: web_sys::Event| {
-                    let Some(window) = web_sys::window() else {
-                        return;
-                    };
-                    if let Some(viewport_px) = window
-                        .inner_height()
-                        .ok()
-                        .and_then(|h| h.as_f64())
-                        .map(|h| h.max(1.0).round() as u32)
-                    {
-                        if viewport_px != *viewport_height_for_cb.read() {
-                            viewport_height_for_cb.set(viewport_px);
-                        }
-                    }
-                    let Some(list_top_in_page) = *container_page_top_for_cb.read() else {
-                        return;
-                    };
-
-                    let scroll_y = window.scroll_y().unwrap_or(0.0);
-                    let relative_scroll = (scroll_y - list_top_in_page).max(0.0) as u32;
-                    if relative_scroll != *scroll_top_for_cb.read() {
-                        scroll_top_for_cb.set(relative_scroll);
-                    }
-                }) as Box<dyn FnMut(web_sys::Event)>);
-
-                let _ =
-                    window.add_event_listener_with_callback("scroll", cb.as_ref().unchecked_ref());
-                window_scroll_listener.set(Some(cb));
-            }
-        });
-
-        use_drop({
-            let mut window_scroll_listener = window_scroll_listener.clone();
-            move || {
-                if let (Some(window), Some(cb)) = (web_sys::window(), window_scroll_listener.take())
-                {
-                    let _ = window
-                        .remove_event_listener_with_callback("scroll", cb.as_ref().unchecked_ref());
-                }
-            }
-        });
-    }
-
-    // Dynamic-height virtualization
-    // Get the viewport height and buffer height. Height need to render = viewport + buffer.
-    let current_scroll = *scroll_top.read();
-    let viewport_px = {
-        #[cfg(target_arch = "wasm32")]
-        {
-            (*viewport_height.read()).max(estimated_item_height)
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            estimated_item_height.saturating_mul(8)
-        }
-    };
-    let buffer_px = (buffer as u32).saturating_mul(estimated_item_height);
-
-    // Rebuild prefix sums when measured heights change.
-    // each item has a height, and the prefix sum is the cumulative height of all items up to that point.
-    let prefix_and_total = use_memo({
-        let measured_heights = measured_heights.clone();
-        move || {
-            let heights = measured_heights.read();
-            let mut prefix: Vec<u32> = Vec::with_capacity(heights.len() + 1);
-            prefix.push(0);
-            for height in heights.iter() {
-                let next = prefix
-                    .last()
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add((*height).max(1));
-                prefix.push(next);
-            }
-            let total_height = *prefix.last().unwrap_or(&0);
-            (Arc::new(prefix), total_height)
-        }
+    // --- Measurements memo ---
+    // Recomputes whenever count or the size cache changes.
+    let measurements = use_memo(move || {
+        let n = count_sig();
+        let cache = size_cache.read();
+        compute_measurements(n, &cache, estimate_size.map(|f| f as &dyn Fn(usize) -> u32))
     });
 
-    // Calculate visible range from scroll position using prefix sums.
-    let (prefix, total_height) = prefix_and_total();
-    let prefix: &[u32] = prefix.as_ref();
+    // --- JS scroll bridge ---
+    // Attaches a scroll listener to the container element via dioxus eval.
+    // Sends { offset, viewport, isScrolling } messages to the Rust side.
+    // The script blocks on a second recv() for cleanup (called on drop).
+    use_effect(move || {
+        let script = r#"
+            const container = document.getElementById(await dioxus.recv());
+            if (!container) return;
 
-    let (render_start, mut end_idx) = if total == 0 {
-        (0, 0)
-    } else {
-        // find the item at a given y position
-        let item_at = |y: u32| prefix.partition_point(|&acc| acc <= y).saturating_sub(1);
+            let scrollEndTimer = null;
+            let lastOffset = null;
 
-        // find the index at the current scroll position
-        let clamped_scroll = current_scroll.min(total_height.saturating_sub(1));
-        let render_start = item_at(clamped_scroll.saturating_sub(buffer_px));
+            function publish(isScrolling) {
+                const scroll = Math.round(container.scrollTop);
+                // Deduplicate: skip if offset hasn't changed and we're not scrolling
+                if (!isScrolling && scroll === lastOffset) return;
+                lastOffset = scroll;
+                const viewport = Math.min(container.clientHeight, window.innerHeight) || 600;
+                dioxus.send({ offset: scroll, viewport: viewport, isScrolling: isScrolling });
+            }
 
-        // find the index at the end of the viewport + buffer
-        let end_target = clamped_scroll
-            .saturating_add(viewport_px)
-            .saturating_add(buffer_px);
-        let end_idx = prefix.partition_point(|&acc| acc < end_target).min(total);
+            function onScroll() {
+                if (scrollEndTimer !== null) clearTimeout(scrollEndTimer);
+                publish(true);
+                // Debounce scroll-end detection (150 ms after last event)
+                scrollEndTimer = setTimeout(() => {
+                    scrollEndTimer = null;
+                    publish(false);
+                }, 150);
+            }
 
-        (render_start, end_idx)
-    };
+            // Initial publish (handles page already scrolled on mount)
+            publish(false);
 
-    if total > 0 && end_idx <= render_start {
-        end_idx = (render_start + 1).min(total);
-    }
-    // set the top and bottom spacers, make scroll view as actual height as it should be
-    let top_spacer = prefix[render_start];
-    let bottom_spacer = total_height.saturating_sub(prefix[end_idx]);
-    rsx! {
-        div {
-            class: "cycle-list-container",
-            onmounted: move |_event: Event<MountedData>| {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let element = _event.as_web_event();
-                    if let Ok(html_el) = element.dyn_into::<HtmlElement>() {
-                        if let Some(window) = web_sys::window() {
-                            let scroll_y = window.scroll_y().unwrap_or(0.0);
-                            let rect = html_el.get_bounding_client_rect();
-                            container_page_top.set(Some(rect.top() + scroll_y));
-                        }
-                        container_el.set(Some(html_el));
+            container.addEventListener("scroll", onScroll, { passive: true });
+            window.addEventListener("resize", () => publish(false), { passive: true });
+
+            // Wait for the Rust side to signal teardown (eval dropped on unmount)
+            await dioxus.recv();
+            if (scrollEndTimer !== null) clearTimeout(scrollEndTimer);
+            container.removeEventListener("scroll", onScroll);
+        "#;
+
+        let mut eval = document::eval(script);
+        let _ = eval.send(container_id.peek().clone());
+
+        spawn(async move {
+            while let Ok(msg) = eval.recv::<ScrollMsg>().await {
+                let was_scrolling = *is_scrolling.peek();
+
+                if msg.is_scrolling && !was_scrolling {
+                    // New scroll gesture: reset correction accumulators and freeze
+                    // total size so the scrollbar length stays stable.
+                    scroll_adjustments.set(0);
+                    deferred_adjustments.set(0);
+                    let frozen = measurements.peek().last().map(|m| m.end()).unwrap_or(0);
+                    stable_total_size.set(Some(frozen));
+                }
+
+                if !msg.is_scrolling && was_scrolling {
+                    // Scroll ended: unfreeze total size.
+                    stable_total_size.set(None);
+
+                    // Apply any corrections that were deferred during the gesture.
+                    let deferred = *deferred_adjustments.peek();
+                    if deferred != 0 {
+                        let new_scroll = (msg.offset as i32 + deferred).max(0) as u32;
+                        deferred_adjustments.set(0);
+                        viewport_size.set(msg.viewport);
+                        is_scrolling.set(false);
+                        scroll_offset.set(new_scroll);
+                        let cid = container_id.peek().clone();
+                        sync_container_scroll(cid, new_scroll).await;
+                        continue;
                     }
                 }
-            },
 
-            // Top spacer
-            div { style: "height:{top_spacer}px; width:1px;" }
+                viewport_size.set(msg.viewport);
+                is_scrolling.set(msg.is_scrolling);
+                scroll_offset.set(msg.offset);
+            }
+        });
+    });
 
-            // Render visible slice using the provided render_item
-            {
-                items
-                    .iter()
-                    .skip(render_start)
-                    .take(end_idx - render_start)
-                    .enumerate()
-                    .map(|(i, item)| {
-                        let idx = render_start + i;
-                        let _measured_heights_for_item = measured_heights.clone();
+    // --- Render ---
 
+    // Reading scroll_offset and viewport_size subscribes this component so it
+    // re-renders on scroll.  Reading measurements subscribes on height changes.
+    let current_scroll = *scroll_offset.read();
+    let current_viewport = *viewport_size.read();
+    let m = measurements.read();
+
+    let total_size = match *stable_total_size.read() {
+        Some(frozen) => frozen,
+        None => m.last().map(|i| i.end()).unwrap_or(0),
+    };
+    let canvas_height = total_size.max(current_viewport);
+
+    let virtual_items = get_virtual_items(&m, current_scroll, current_viewport, buffer);
+    let top_offset = virtual_items.first().map(|i| i.start).unwrap_or(0);
+    let set_size = count.to_string();
+
+    // onresize callback: measures the actual rendered height of each row and
+    // stores it in the size cache.  If the measured height differs from the
+    // estimate and the item sits above the viewport, adjusts scrollTop to
+    // prevent content from jumping.
+    let onresize = move |idx: usize| {
+        move |event: Event<ResizeData>| {
+            let rect = event.data().get_content_box_size().unwrap_or_default();
+            let new_size = rect.height.max(1.0).round() as u32;
+
+            let m_peek = measurements.peek();
+            let Some(item) = m_peek.get(idx) else { return };
+
+            let old_size = {
+                let cache = size_cache.peek();
+                cache.get(&idx).copied().unwrap_or(item.size)
+            };
+
+            let delta = new_size as i32 - old_size as i32;
+            // Ignore sub-pixel noise (<= 2 px) to avoid render loops.
+            if delta.abs() <= 2 {
+                return;
+            }
+
+            let item_start = item.start;
+            drop(m_peek);
+
+            size_cache.write().insert(idx, new_size);
+
+            // Only adjust scroll when the resized item is above the viewport.
+            let adjusted_scroll =
+                (*scroll_offset.peek() as i32 + *scroll_adjustments.peek()).max(0) as u32;
+            let is_above = item_start < adjusted_scroll;
+            let scrolling_now = *is_scrolling.peek();
+
+            if is_above && !scrolling_now {
+                let adj = *scroll_adjustments.peek();
+                scroll_adjustments.set(adj + delta);
+                let new_scroll = (*scroll_offset.peek() as i32 + delta).max(0) as u32;
+                scroll_offset.set(new_scroll);
+                let cid = container_id.peek().clone();
+                spawn(async move {
+                    sync_container_scroll(cid, new_scroll).await;
+                });
+            } else if is_above && scrolling_now {
+                let deferred = *deferred_adjustments.peek();
+                deferred_adjustments.set(deferred + delta);
+            }
+        }
+    };
+
+    rsx! {
+        div {
+            id: container_id,
+            class: "recycle-list-container",
+            role: "list",
+            tabindex: "0",
+
+            // Virtual canvas: full scroll height, relative positioning root.
+            div {
+                style: "position: relative; height: {canvas_height}px; width: 100%;",
+
+                // Visible strip: absolute, shifted down by translateY instead of
+                // a top spacer so the browser can GPU-composite the transform.
+                div {
+                    style: "position: absolute; inset: 0 auto auto 0; width: 100%; transform: translateY({top_offset}px); will-change: transform;",
+
+                    {virtual_items.iter().map(|item| {
+                        let idx = item.index;
                         rsx! {
                             div {
                                 key: "{idx}",
-                                onmounted: move |_event: Event<MountedData>| {
-                                    #[cfg(target_arch = "wasm32")]
-                                    {
-                                        let mut measured_heights_for_item = _measured_heights_for_item.clone();
-                                        spawn(async move {
-                                            let rect = _event.get_client_rect().await.unwrap_or_default();
-                                            let measured = rect.height().max(1.0).round() as u32;
-                                            measured_heights_for_item
-                                                .with_mut(|heights| {
-                                                    if idx < heights.len() && heights[idx] != measured {
-                                                        heights[idx] = measured;
-                                                    }
-                                                });
-                                        });
-                                    }
-                                },
-                                {render_item(item, idx)}
+                                role: "listitem",
+                                "data-virtual-index": "{idx}",
+                                "aria-setsize": "{set_size}",
+                                "aria-posinset": "{idx + 1}",
+                                onresize: onresize(idx),
+                                {render_item(&items[idx], idx)}
                             }
                         }
-                    })
+                    })}
+                }
             }
-            // Bottom spacer
-            div { style: "height:{bottom_spacer}px; width:1px;" }
         }
     }
 }
@@ -284,5 +407,26 @@ where
         items,
         buffer,
         render_item,
+        estimate_size: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Programmatically set `scrollTop` on the container without firing a scroll
+/// event (the container's own listener will pick it up naturally on the next
+/// paint, which is fine).
+async fn sync_container_scroll(container_id: String, scroll_top: u32) {
+    let eval = document::eval(
+        r#"
+        const id = await dioxus.recv();
+        const targetScroll = await dioxus.recv();
+        const container = document.getElementById(id);
+        if (container) container.scrollTop = targetScroll;
+        "#,
+    );
+    let _ = eval.send(container_id);
+    let _ = eval.send(scroll_top);
 }
